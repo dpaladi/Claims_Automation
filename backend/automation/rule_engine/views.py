@@ -1,0 +1,649 @@
+import json
+
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+
+from .models import ClaimsData, RuleEdge, RuleEngine, RuleLogic, RuleList, RuleEngineProcessed
+from .registry import get_all_functions
+from .executor import GraphRuleExecutor as RuleExecutor
+from .utils import topological_sort
+from .serializers import RuleEngineSerializer, RuleListSerializer
+# from ..scheduler import load_active_jobs
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
+
+from django.conf import settings
+from django.db.models import Sum
+from django.db.models.functions import TruncDate, TruncWeek, TruncMonth
+from django.utils.dateparse import parse_date
+
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.exceptions import ValidationError
+
+from rule_engine.models import RuleLogic, ParamModel
+
+
+# backend/views.py
+import csv
+from datetime import datetime
+from django.http import StreamingHttpResponse, HttpResponseBadRequest
+from django.utils import timezone
+
+
+from math import ceil
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.response import Response
+from rest_framework.exceptions import ValidationError
+
+class StandardResultsSetPagination(PageNumberPagination):
+    page_size_query_param = "limit"
+    max_page_size = 500
+
+    def get_paginated_response(self, data):
+        total_pages = ceil(self.page.paginator.count / self.page_size)
+        return Response({
+            "count": self.page.paginator.count,
+            "total_pages": total_pages,
+            "current_page": self.page.number,
+            "results": data,
+        })
+
+
+@api_view(["GET"])
+def dashboard(request):
+    params = request.query_params
+    aggregate = params.get("aggregate") == "true"
+
+    qs = RuleEngineProcessed.objects.all().order_by("-processed_at", "-id")
+
+    # -------- DATE FILTERING --------
+    start_date_str = params.get("start_date")
+    end_date_str = params.get("end_date")
+    
+    if start_date_str:
+        start_date = parse_date(start_date_str)
+        if start_date:
+            qs = qs.filter(processed_at__date__gte=start_date)
+    
+    if end_date_str:
+        end_date = parse_date(end_date_str)
+        if end_date:
+            qs = qs.filter(processed_at__date__lte=end_date)
+
+    paginator = StandardResultsSetPagination()
+    paginator.page_size = 10  # Default page size
+    page = paginator.paginate_queryset(qs, request)
+
+    # ---------------- LIST MODE ----------------
+    if not aggregate:
+        data = [
+            {
+                "id": obj.id,
+                "rule_engine": {
+                    "id": obj.rule_engine_id,
+                    "rule_name": obj.rule_name,
+                },
+                "processed_at": obj.processed_at,
+                "claims_count": obj.claims_count,
+            }
+            for obj in page
+        ]
+        response = paginator.get_paginated_response(data)
+
+        # ---------------- CLAIMS STATUS SUMMARY ----------------
+        claims_qs = ClaimsData.objects.all()
+        if start_date_str:
+            start_date = parse_date(start_date_str)
+            if start_date:
+                claims_qs = claims_qs.filter(processed_date__date__gte=start_date)
+        if end_date_str:
+            end_date = parse_date(end_date_str)
+            if end_date:
+                claims_qs = claims_qs.filter(processed_date__date__lte=end_date)
+
+        total_count = claims_qs.count()
+        
+        # Anything containing this text = Already Released
+        already_released_count = claims_qs.filter(
+        status__icontains="FBR 15   NO FOLLOW UP FOR THIS SELECTION"
+        ).count()
+        
+        # Only exact DONE.
+        processed_count = claims_qs.filter(
+        status__iexact="DONE."
+        ).count()
+
+        # Everything else
+        unprocessed_count = (total_count - processed_count - already_released_count)
+        
+
+        response.data["claims_summary"] = {
+        "processed": processed_count,
+        "already_released": already_released_count,
+        "unprocessed": unprocessed_count,
+        "total": total_count,
+        }
+        return response
+
+    # ---------------- AGGREGATE MODE ----------------
+    group_by = params.get("group_by")
+    if group_by not in ("day", "week", "month"):
+        raise ValidationError({"group_by": "day, week, month required"})
+
+    trunc_map = {
+        "day": TruncDate("processed_at"),
+        "week": TruncWeek("processed_at"),
+        "month": TruncMonth("processed_at"),
+    }
+
+    agg_qs = (
+        qs.annotate(period_start=trunc_map[group_by])
+          .values("period_start")
+          .annotate(claims_count=Sum("claims_count"))
+          .order_by("-period_start")
+    )
+
+    page = paginator.paginate_queryset(agg_qs, request)
+
+    return paginator.get_paginated_response([
+        {
+            "period_start": row["period_start"],
+            "claims_count": row["claims_count"],
+        }
+        for row in page
+    ])
+
+
+
+
+@api_view(["GET"])
+def discover_functions(request):
+
+    functions = RuleLogic.objects.all()
+
+    result = []
+
+    for function in functions:
+
+        inputs = _get_params(function.input_params)
+
+        outputs = _get_params(function.output_params)
+
+        result.append({
+            "function_name": function.function_name,
+            "inputs": inputs,
+            "outputs": outputs,
+            "tag":   function.tag,
+            "color": function.color,
+        })
+
+    return Response(result)
+
+
+def _get_params(parameter_group_id):
+
+    if not parameter_group_id:
+        return []
+
+    params = ParamModel.objects.filter(
+        parameter_group_id=parameter_group_id
+    ).exclude(param_name="__group__")
+
+    return [
+        {
+            "name": param.param_name,
+            "type": param.param_type,
+            "options": param.param_options,
+            "default": param.param_default,
+        }
+        for param in params
+    ]
+
+
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+from rest_framework import status
+
+from .models import RuleEngine, RuleList, RuleLogic, RuleEdge
+@api_view(["POST"])
+def save_rule(request):
+
+    rule_name = request.data.get("rule_name")
+    nodes = request.data.get("nodes")
+    edges = request.data.get("edges")
+    rule_id = request.data.get("rule_id")  # Present only in edit mode
+
+    # -------- VALIDATION --------
+    if not rule_name:
+        return Response(
+            {"error": "rule_name is required"},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    if not nodes:
+        return Response(
+            {"error": "nodes are required"},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    if edges is None:
+        return Response(
+            {"error": "edges are required (can be empty list)"},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    existing_rule = RuleEngine.objects.filter(rule_name=rule_name).first()
+    if not  rule_id and existing_rule :
+        return Response(
+               f"Rule with name '{rule_name}' Already found",
+                status=status.HTTP_400_BAD_REQUEST
+                
+            )
+    # Add IDs to edges if missing
+    for i, edge in enumerate(edges):
+        if "id" not in edge:
+            edge["id"] = f"edge-{i+1}"
+
+    # -------- EDIT MODE: UPDATE EXISTING RULE IN-PLACE --------
+    if rule_id:
+        try:
+            rule_engine = RuleEngine.objects.get(id=rule_id)
+        except RuleEngine.DoesNotExist:
+            return Response(
+                {"error": f"Rule with id '{rule_id}' not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Update top-level fields on the existing record (id stays the same)
+        rule_engine.rule_name = rule_name
+        rule_engine.reactflow_json = {"nodes": nodes, "edges": edges}
+        rule_engine.save()
+
+        # Clear only the child nodes and edges — reporting rows keep their FK intact
+        RuleEdge.objects.filter(rule_engine=rule_engine).delete()
+        RuleList.objects.filter(rule_engine=rule_engine).delete()
+
+    # -------- CREATE MODE: NEW RULE ENGINE --------
+    else:
+        rule_engine = RuleEngine.objects.create(
+            rule_name=rule_name,
+            reactflow_json={"nodes": nodes, "edges": edges}
+        )
+
+    # -------- REBUILD NODES --------
+    node_instance_map = {}
+
+    for index, node in enumerate(nodes):
+
+        node_id = node.get("id")
+        data = node.get("data", {})
+
+        function_name = data.get("function_name")
+        params = data.get("params", {})
+
+        if not function_name:
+            return Response(
+                {"error": f"function_name missing in node {node_id}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Verify the function exists in RuleLogic
+        # (for validation, but don't create a FK relationship)
+        try:
+            rule_logic = RuleLogic.objects.get(
+                function_name=function_name
+            )
+        except RuleLogic.DoesNotExist:
+            return Response(
+                {"error": f"Function '{function_name}' not registered"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Store function_name as a string, not as a FK reference
+        rule_node = RuleList.objects.create(
+            rule_engine=rule_engine,
+            function_name=function_name,
+            rule_function_order=index,
+            params=params
+        )
+
+        node_instance_map[node_id] = rule_node
+
+    # -------- REBUILD EDGES --------
+    for edge in edges:
+
+        source_id = edge.get("source")
+        target_id = edge.get("target")
+        condition = edge.get("condition")
+
+        if source_id not in node_instance_map:
+            return Response(
+                {"error": f"Invalid source node: {source_id}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if target_id not in node_instance_map:
+            return Response(
+                {"error": f"Invalid target node: {target_id}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        RuleEdge.objects.create(
+            rule_engine=rule_engine,
+            source=node_instance_map[source_id],
+            target=node_instance_map[target_id],
+            condition=condition
+        )
+
+    return Response(
+        {
+            "message": "Rule updated successfully" if rule_id else "Rule saved successfully",
+            "rule_engine_id": rule_engine.id
+        },
+        status=status.HTTP_201_CREATED
+    )
+
+# API 3: Execute Rule (Debug)
+
+@api_view(["POST"])
+def execute_rule(request, rule_id):
+    rule_engine = RuleEngine.objects.filter(id=rule_id).first()
+    if not rule_engine:
+        return Response(
+            {"error": f"Rule with id '{rule_id}' not found"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+    executor = RuleExecutor(rule_id,True)
+
+    result = executor.execute()
+
+    return Response({"success":True})
+
+
+# API 4: List Rules
+
+@api_view(["GET"])
+def list_rules(request):
+
+    rules = RuleEngine.objects.filter(deleted=False).order_by("-created_at").all()
+
+    # Return only id and rule_name
+    rules_data = [
+        {"id": rule.id, "rule_name": rule.rule_name}
+        for rule in rules
+    ]
+
+    return Response(rules_data)
+
+
+# API 5: Rule Details
+
+@api_view(["GET","DELETE"])
+def rule_details(request, rule_id):
+    if request.method == "DELETE":
+        try:
+            rule = RuleEngine.objects.get(id=rule_id)
+            rule.deleted = True
+            rule.save()
+            return Response(
+                {"message": "Rule deleted successfully"},
+                status=status.HTTP_200_OK
+            )
+        except RuleEngine.DoesNotExist:
+            return Response(
+                {"error": "Rule not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+    if request.method == "GET":
+        rule = RuleEngine.objects.get(id=rule_id)
+
+        steps = RuleList.objects.filter(
+            rule_engine=rule
+        )
+
+        steps_serializer = RuleListSerializer(
+            steps,
+            many=True
+        )
+
+        # Ensure edges have IDs
+        reactflow_json = rule.reactflow_json
+        edges = reactflow_json.get("edges", [])
+        for i, edge in enumerate(edges):
+            if "id" not in edge:
+                edge["id"] = f"edge-{i+1}"
+
+        return Response({
+            "rule_engine": rule.rule_name,
+            "reactflow_json": reactflow_json,
+            "steps": steps_serializer.data
+        })
+
+
+
+class Echo:
+    """A minimal file-like wrapper that just returns the value."""
+    def write(self, value):
+        return value
+
+def _parse_date(value: str | None):
+    if not value:
+        return None
+    try:
+        if len(value) == 10:
+            # YYYY-MM-DD
+            return datetime.strptime(value, "%Y-%m-%d")
+        # ISO-like datetime string
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+def export_claims_csv(request):
+    if request.method != "GET":
+        return HttpResponseBadRequest("Only GET allowed.")
+
+    start = _parse_date(request.GET.get("start"))
+    end = _parse_date(request.GET.get("end"))
+    rule_name = request.GET.get("rule_name")
+    rule_engine_id = request.GET.get("rule_engine_id")
+    qs = ClaimsData.objects.all().only(
+        "claims_id", "processed_date", "rule_name", "manual", "status", "decision"
+    )
+
+    if rule_name:
+        qs = qs.filter(rule_name__iexact=rule_name)
+    if start:
+        qs = qs.filter(processed_date__gte=start)
+    if rule_engine_id:
+        qs = qs.filter(rule_engine_id=rule_engine_id)
+
+    headers = ["claims_id", "processed_date", "rule_name", "manual", "status", "decision"]
+    pseudo_buffer = Echo()
+    writer = csv.writer(pseudo_buffer)
+
+    def row_iter():
+        yield writer.writerow(headers)
+        for row in qs.order_by("processed_date").iterator(chunk_size=2000):
+            yield writer.writerow([
+                row.claims_id,
+                row.processed_date.isoformat() if row.processed_date else "",
+                row.rule_name,
+                "TRUE" if row.manual else "FALSE",
+                row.status,
+                row.decision,
+            ])
+
+    filename = f"claims_export_{timezone.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    resp = StreamingHttpResponse(row_iter(), content_type="text/csv; charset=utf-8")
+    resp["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return resp
+
+
+
+from .models import ScheduledJob
+
+
+# ─────────────────────────────────────────────
+# GET  /scheduler/jobs/        → list all jobs
+# POST /scheduler/jobs/        → create a job
+# ─────────────────────────────────────────────
+
+@api_view(["GET", "POST"])
+def scheduled_jobs(request):
+
+    if request.method == "GET":
+        return _list_jobs(request)
+
+    if request.method == "POST":
+        return _create_job(request)
+
+def _fetch_schedule(job):
+    schedule = None
+    if job.schedule_config.get("type") == "interval":
+        schedule = f"Every {job.interval} {job.unit}"
+    elif job.schedule_config.get("type") == "weekly":
+        schedule = f"Every Week on {job.schedule_config.get('days', 'Monday')} at {job.schedule_config.get('time', '00:00')}"
+    elif job.schedule_config.get("type") == "daily":
+        schedule = f"Daily at {job.schedule_config.get('time', '00:00')}"
+    elif job.schedule_config.get("type") == "once":
+        schedule = f"Run Once at {job.schedule_config.get('date').split("T")[0] +\
+                                   " " + job.schedule_config.get('date').split("T")[1]}"
+    return schedule
+
+def _list_jobs(request):
+    jobs = ScheduledJob.objects.all()
+
+    data = [
+        {
+            "id":         job.id,
+            "rule_name":  job.rule_name,
+            "rule_id":    job.rule_id,
+            "interval":   job.interval,
+            "unit":       job.unit,
+            # "schedule":   _fetch_schedule(job),# human-readable
+            "is_active":  job.is_active,
+            "created_at": job.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at": job.updated_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "combinations": job.combinations,
+            "schedule_config": job.schedule_config,
+            "job_name": job.job_name,
+        }
+        for job in jobs
+    ]
+
+    return Response({
+            "count":   len(data),
+            "results": data,
+        }, status=status.HTTP_200_OK)
+
+def _create_job(request):
+    #rule_name = request.data.get("rule_name", "").strip()
+    rule_id  = int(request.data.get("rule_id"))
+    interval  = request.data.get("interval")
+    unit      = request.data.get("unit", "seconds")
+    is_active = request.data.get("is_active", True)
+    combinations = request.data.get("combinations", None)
+    schedule_config = request.data.get("schedule_config", None)
+    job_name = request.data.get("job_name", "").strip()
+    # ── Validation ──────────────────────────────────────────────────────────
+    existing_job = ScheduledJob.objects.filter(job_name=job_name).first()
+    if existing_job:
+        return Response({"error": "Job Name already exists"}, status=status.HTTP_400_BAD_REQUEST)
+    if schedule_config.get("type") == "interval" and interval is None:
+        return Response({"error": "interval is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        if interval:
+            interval = int(interval)
+            if interval <= 0:
+                raise ValueError
+    except (ValueError, TypeError):
+        return Response({"error": "interval must be a positive integer"}, status=status.HTTP_400_BAD_REQUEST)
+
+    if unit not in ("seconds", "minutes", "hours"):
+        return Response({"error": "unit must be one of: seconds, minutes, hours"}, status=status.HTTP_400_BAD_REQUEST)
+
+    # ── Upsert (update if rule_name exists, create if not) ──────────────────
+    rule_name = RuleEngine.objects.filter(id=rule_id).values_list("rule_name", flat=True).first()
+    job, created = ScheduledJob.objects.update_or_create(
+        rule_name=rule_name,
+        job_name = job_name,
+        defaults={
+            "rule_id":   rule_id,
+            "interval":  interval,
+            "unit":      unit,
+            "is_active": is_active,
+            "combinations": combinations,  # ← ADD THIS
+            "schedule_config": schedule_config, 
+        },
+    )
+
+    return Response({
+            "message":   "Job created" if created else "Job updated",
+            "id":        job.id,
+            "rule_name": job.rule_name,
+            "interval":  job.interval,
+            "unit":      job.unit,
+            "schedule":  f"every {job.interval} {job.unit}",
+            "is_active": job.is_active,
+        }, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+
+
+# ─────────────────────────────────────────────
+# PATCH /scheduler/jobs/<id>/toggle/  → pause / resume
+# DELETE /scheduler/jobs/<id>/        → remove a job
+# ─────────────────────────────────────────────
+
+@api_view(["PATCH"])
+def toggle_job(request, job_id):
+    try:
+        job = ScheduledJob.objects.get(id=job_id)
+    except ScheduledJob.DoesNotExist:
+        return Response(
+            {"error": f"Job {job_id} not found"},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    job.is_active = not job.is_active
+    job.save(update_fields=["is_active", "updated_at"])
+    # load_active_jobs()  # Sync changes to the scheduler immediately
+    return Response({
+            "message":   "Job resumed" if job.is_active else "Job paused",
+            "id":        job.id,
+            "rule_name": job.rule_name,
+            "is_active": job.is_active,
+        }, status=status.HTTP_200_OK)
+
+
+@api_view(["DELETE"])
+def delete_job(request, job_id):
+    try:
+        job = ScheduledJob.objects.get(id=job_id)
+    except ScheduledJob.DoesNotExist:
+        return Response({"error": f"Job {job_id} not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    rule_name = job.rule_name
+    job.delete()
+
+    return Response({"message": f"Job '{rule_name}' deleted"}, status=status.HTTP_200_OK)
+
+
+from .registry import FUNCTION_REGISTRY, sync_registry_to_db
+
+@api_view(["POST"])
+def refresh_functions(request):
+    from django.db import transaction
+
+    with transaction.atomic():
+        ParamModel.objects.all().delete()
+        RuleLogic.objects.all().delete()
+
+    sync_registry_to_db()
+
+    return Response({"message": f"Refreshed {len(FUNCTION_REGISTRY)} function(s)."}, status=status.HTTP_200_OK)
